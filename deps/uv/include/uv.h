@@ -1516,6 +1516,8 @@ UV_EXTERN int uv_fs_link(uv_loop_t* loop,
  */
 #define UV_FS_SYMLINK_JUNCTION     0x0002
 
+#define UV_FS_FILE_WAS_PRESIZED 0x80000
+
 UV_EXTERN int uv_fs_symlink(uv_loop_t* loop,
                             uv_fs_t* req,
                             const char* path,

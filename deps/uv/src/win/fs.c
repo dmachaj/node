@@ -440,6 +440,8 @@ INLINE static int fs__readlink_handle(HANDLE handle, char** target_ptr,
   return fs__wide_to_utf8(w_target, w_target_len, target_ptr, target_len_ptr);
 }
 
+//#define SMALL_FILE_ALLOCATION_SIZE 128LL * 1024LL;  // 128KB
+#define SMALL_FILE_ALLOCATION_SIZE (16LL * 1024LL)  // 16KB
 
 void fs__open(uv_fs_t* req) {
   DWORD access;
@@ -447,6 +449,7 @@ void fs__open(uv_fs_t* req) {
   DWORD disposition;
   DWORD attributes = 0;
   HANDLE file;
+  DWORD preExtendFile = 0;
   int fd, current_umask;
   int flags = req->fs.info.file_flags;
   struct uv__fd_info_s fd_info;
@@ -628,6 +631,25 @@ void fs__open(uv_fs_t* req) {
     }
     return;
   }
+  //else if (disposition == CREATE_ALWAYS) {
+  //  DWORD error = GetLastError();
+  //  if (error == 0) {
+  //    /* A new file has been created, otherwise error would be ERROR_ALREADY_EXISTS .
+  //     * Go ahead and pre-allocate some space to improve write performance. */
+  //    FILE_ALLOCATION_INFO info;
+  //    info.AllocationSize.QuadPart = 512LL * 1024LL;  // 512KB
+  //    SetFileInformationByHandle(file, FileAllocationInfo, &info, sizeof(info));
+  //  }
+  //}
+  else if (disposition == CREATE_ALWAYS) {
+    DWORD error = GetLastError();
+    if (error == 0) {
+      if (flags & UV_FS_O_FILEMAP) {
+        // We only have the necessary tracking for file maps :(
+        preExtendFile = 1;
+      }
+    }
+  }
 
   fd = _open_osfhandle((intptr_t) file, flags);
   if (fd < 0) {
@@ -667,6 +689,23 @@ void fs__open(uv_fs_t* req) {
         return;
       }
 
+      // After checking size, before opening fil emapping
+      if (preExtendFile != 0) {
+        /* A new file has been created, otherwise error would be
+         * ERROR_ALREADY_EXISTS .
+         * Go ahead and pre-size the file to 512KB.  Move the pointer, size it,
+         * and reset the pointer back to 0 Error checking skipped because this
+         * is a prototype. Record that we did something sketchy so that
+         * closefile can undo it. */
+        LARGE_INTEGER newPointer;
+        newPointer.QuadPart = SMALL_FILE_ALLOCATION_SIZE;
+        SetFilePointerEx(file, newPointer, NULL, FILE_BEGIN);
+        SetEndOfFile(file);
+        newPointer.QuadPart = 0;
+        SetFilePointerEx(file, newPointer, NULL, FILE_BEGIN);
+        fd_info.flags |= UV_FS_FILE_WAS_PRESIZED;
+      }
+
       if (fd_info.size.QuadPart == 0) {
         fd_info.mapping = INVALID_HANDLE_VALUE;
       } else {
@@ -703,9 +742,38 @@ void fs__close(uv_fs_t* req) {
 
   VERIFY_FD(fd, req);
 
+  //if (uv__fd_hash_get(fd, &fd_info)) {
+  //  /* If we did our sketchy file sizing on create then snap to the final file
+  //   * size on close */
+  //  if (fd_info.flags & UV_FS_FILE_WAS_PRESIZED) {
+  //    HANDLE handle;
+  //    handle = uv__get_osfhandle(fd);
+  //    SetFilePointerEx(handle, fd_info.size, NULL, FILE_BEGIN);
+  //    if (!SetEndOfFile(handle)) {
+  //      DWORD error = GetLastError();
+  //      error;
+  //    }
+  //  }
+  //}
+
   if (uv__fd_hash_remove(fd, &fd_info)) {
+
     if (fd_info.mapping != INVALID_HANDLE_VALUE) {
       CloseHandle(fd_info.mapping);
+    }
+
+    /* If we did our sketchy file sizing on create then snap to the final file
+     * size on close */
+    if (fd_info.flags & UV_FS_FILE_WAS_PRESIZED) {
+      if (fd_info.size.QuadPart < SMALL_FILE_ALLOCATION_SIZE) { // don't bother unless we really need to shrink it
+        HANDLE handle;
+        handle = uv__get_osfhandle(fd);
+        SetFilePointerEx(handle, fd_info.size, NULL, FILE_BEGIN);
+        if (!SetEndOfFile(handle)) {
+          DWORD error = GetLastError();
+          error;
+        }
+      }
     }
   }
 
@@ -1104,6 +1172,14 @@ void fs__write(uv_fs_t* req) {
     bytes += incremental_bytes;
     ++index;
   } while (result && index < req->fs.info.nbufs);
+
+  // After writing to the file get the current size so we have it for later
+  // We don't have a fd_info here though.
+  //if (fd_info.flags & UV_FS_FILE_WAS_PRESIZED) {
+  //  if (!GetFileSizeEx(handle, &fd_info.size)) {
+  //    // TODO handle error
+  //  }
+  //}
 
   if (restore_position)
     SetFilePointerEx(handle, original_position, NULL, FILE_BEGIN);
